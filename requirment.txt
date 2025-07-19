@@ -1,0 +1,11 @@
+fastapi                 # Web framework
+uvicorn                 # ASGI server
+authlib                 # GitHub OAuth
+python-jose             # JWT handling
+boto3                   # AWS S3 SDK
+docker                  # Docker SDK for Python
+pydantic                # Data validation
+python-dotenv           # Environment variables
+requests                # HTTP client
+httpx                   # Async HTTP client
+jinja2                  # Template engine (for Caddy config)
