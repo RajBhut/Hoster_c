@@ -9,6 +9,8 @@ import tempfile
 import json
 import base64
 import boto3
+import threading
+import time
 from dotenv import load_dotenv
 
 from app.config import oauth
@@ -35,6 +37,14 @@ try:
     print("Docker client initialized successfully")
 except Exception as e:
     print(f"Docker not available: {e}")
+
+# Track running backend containers
+running_backend_containers = {}
+
+def cleanup_container(container_id):
+    """Clean up container from tracking after it stops"""
+    if container_id in running_backend_containers:
+        del running_backend_containers[container_id]
 
 @project_router.get("/repos")
 async def get_user_repos(request: Request):
@@ -76,7 +86,6 @@ async def get_user_repos(request: Request):
 
 @project_router.get("/check-react/{owner}/{repo}")
 async def check_if_react_project(request: Request, owner: str, repo: str):
-    """Check if a specific repository is a React project with deep scanning"""
     token = request.session.get('token')
     if not token:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
@@ -192,6 +201,176 @@ async def check_react_in_directory(headers, owner: str, repo: str, directory_pat
             "details": f"Error checking directory: {str(e)}"
         }
 
+@project_router.get("/check-backend/{owner}/{repo}")
+async def check_if_backend_project(request: Request, owner: str, repo: str):
+    """Detect if repository contains Node.js or Python backend projects"""
+    token = request.session.get('token')
+    if not token:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    try:
+        headers = {'Authorization': f'token {token["access_token"]}'}
+        
+        # Check root level first
+        backend_check_root = await check_backend_in_directory(headers, owner, repo, "")
+        if backend_check_root["is_backend"]:
+            return {
+                "is_backend": True,
+                "project_path": "",
+                "backend_type": backend_check_root["backend_type"],
+                "details": backend_check_root["details"]
+            }
+        
+        # Check subdirectories
+        try:
+            contents_url = f'https://api.github.com/repos/{owner}/{repo}/contents'
+            contents_response = requests.get(contents_url, headers=headers)
+            
+            if contents_response.status_code == 200:
+                contents = contents_response.json()
+                
+                for item in contents:
+                    if item['type'] == 'dir':
+                        folder_name = item['name']
+                        backend_check_sub = await check_backend_in_directory(headers, owner, repo, folder_name)
+                        
+                        if backend_check_sub["is_backend"]:
+                            return {
+                                "is_backend": True,
+                                "project_path": folder_name,
+                                "backend_type": backend_check_sub["backend_type"],
+                                "details": backend_check_sub["details"]
+                            }
+        except Exception as e:
+            print(f"Error checking subdirectories: {str(e)}")
+        
+        return {
+            "is_backend": False,
+            "project_path": None,
+            "backend_type": None,
+            "details": "No backend project found in root or subdirectories"
+        }
+        
+    except Exception as e:
+        return JSONResponse({
+            "error": str(e),
+            "is_backend": False
+        }, status_code=500)
+
+async def check_backend_in_directory(headers, owner: str, repo: str, directory_path: str):
+    """Check if a directory contains a backend project (Node.js or Python)"""
+    try:
+        backend_info = {
+            "is_backend": False,
+            "backend_type": None,
+            "details": {}
+        }
+        
+        # Check for Node.js project
+        if directory_path:
+            package_json_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{directory_path}/package.json'
+        else:
+            package_json_url = f'https://api.github.com/repos/{owner}/{repo}/contents/package.json'
+        
+        response = requests.get(package_json_url, headers=headers)
+        if response.status_code == 200:
+            content = response.json()
+            if content.get("encoding") == "base64":
+                package_json = base64.b64decode(content['content']).decode('utf-8')
+                package_data = json.loads(package_json)
+                
+                dependencies = package_data.get('dependencies', {})
+                dev_dependencies = package_data.get('devDependencies', {})
+                scripts = package_data.get('scripts', {})
+                
+                # Check for backend frameworks
+                is_express = 'express' in dependencies
+                is_fastify = 'fastify' in dependencies
+                is_koa = 'koa' in dependencies
+                is_nestjs = '@nestjs/core' in dependencies
+                has_start_script = 'start' in scripts or 'dev' in scripts
+                
+                if is_express or is_fastify or is_koa or is_nestjs or has_start_script:
+                    framework = "Unknown"
+                    if is_express:
+                        framework = "Express.js"
+                    elif is_fastify:
+                        framework = "Fastify"
+                    elif is_koa:
+                        framework = "Koa"
+                    elif is_nestjs:
+                        framework = "NestJS"
+                    elif has_start_script:
+                        framework = "Node.js"
+                    
+                    backend_info = {
+                        "is_backend": True,
+                        "backend_type": "nodejs",
+                        "details": {
+                            "framework": framework,
+                            "has_express": is_express,
+                            "has_fastify": is_fastify,
+                            "has_koa": is_koa,
+                            "has_nestjs": is_nestjs,
+                            "has_start_script": has_start_script,
+                            "has_dev_script": 'dev' in scripts,
+                            "scripts": list(scripts.keys()),
+                            "dependencies": list(dependencies.keys())[:10]  # Limit for response size
+                        }
+                    }
+                    return backend_info
+        
+        # Check for Python project
+        python_files = ['requirements.txt', 'app.py', 'main.py', 'server.py', 'wsgi.py', 'asgi.py']
+        for python_file in python_files:
+            if directory_path:
+                file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{directory_path}/{python_file}'
+            else:
+                file_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{python_file}'
+            
+            response = requests.get(file_url, headers=headers)
+            if response.status_code == 200:
+                # Found a Python backend file
+                framework = "Unknown"
+                
+                # Try to detect framework from requirements.txt
+                if python_file == 'requirements.txt':
+                    content = response.json()
+                    if content.get("encoding") == "base64":
+                        requirements = base64.b64decode(content['content']).decode('utf-8')
+                        if 'fastapi' in requirements.lower():
+                            framework = "FastAPI"
+                        elif 'flask' in requirements.lower():
+                            framework = "Flask"
+                        elif 'django' in requirements.lower():
+                            framework = "Django"
+                        elif 'tornado' in requirements.lower():
+                            framework = "Tornado"
+                        else:
+                            framework = "Python"
+                elif python_file in ['app.py', 'main.py']:
+                    framework = "Python"
+                
+                backend_info = {
+                    "is_backend": True,
+                    "backend_type": "python",
+                    "details": {
+                        "framework": framework,
+                        "entry_file": python_file,
+                        "has_requirements": python_file == 'requirements.txt' or 'requirements.txt' in [f for f in python_files]
+                    }
+                }
+                return backend_info
+        
+        return backend_info
+        
+    except Exception as e:
+        return {
+            "is_backend": False,
+            "backend_type": None,
+            "details": f"Error checking directory: {str(e)}"
+        }
+
 @project_router.get("/repo-structure/{owner}/{repo}")
 async def get_repo_structure(request: Request, owner: str, repo: str):
     token = request.session.get('token')
@@ -213,7 +392,8 @@ async def get_repo_structure(request: Request, owner: str, repo: str):
             "files": [],
             "directories": [],
             "has_package_json": False,
-            "react_projects": []
+            "react_projects": [],
+            "backend_projects": []
         }
         
         for item in contents:
@@ -239,6 +419,16 @@ async def get_repo_structure(request: Request, owner: str, repo: str):
                 "details": react_check_root["details"]
             })
         
+        # Check for backend projects in root
+        backend_check_root = await check_backend_in_directory(headers, owner, repo, "")
+        if backend_check_root["is_backend"]:
+            structure["backend_projects"].append({
+                "path": "",
+                "location": "Root directory",
+                "backend_type": backend_check_root["backend_type"],
+                "details": backend_check_root["details"]
+            })
+        
         for directory in structure["directories"]:
             react_check_sub = await check_react_in_directory(headers, owner, repo, directory["name"])
             if react_check_sub["is_react"]:
@@ -247,12 +437,23 @@ async def get_repo_structure(request: Request, owner: str, repo: str):
                     "location": f"Subdirectory: {directory['name']}",
                     "details": react_check_sub["details"]
                 })
+            
+            # Check subdirectories for backend projects
+            backend_check_sub = await check_backend_in_directory(headers, owner, repo, directory["name"])
+            if backend_check_sub["is_backend"]:
+                structure["backend_projects"].append({
+                    "path": directory["name"],
+                    "location": f"Subdirectory: {directory['name']}",
+                    "backend_type": backend_check_sub["backend_type"],
+                    "details": backend_check_sub["details"]
+                })
         
         return {
             "owner": owner,
             "repo": repo,
             "structure": structure,
-            "total_react_projects": len(structure["react_projects"])
+            "total_react_projects": len(structure["react_projects"]),
+            "total_backend_projects": len(structure["backend_projects"])
         }
         
     except Exception as e:
@@ -309,267 +510,6 @@ async def delete_s3_hosted_project(request: Request, owner: str, repo: str):
                 "message": f"No files found for {owner}/{repo} in S3",
                 "deleted_count": 0
             }
-    except Exception as e:
-        return JSONResponse({
-            "success": False,
-            "error": str(e)
-        }, status_code=500)
-
-@project_router.get("/validate/{owner}/{repo}")
-async def validate_repository_for_build(request: Request, owner: str, repo: str):
-    """Validate a repository before building to help debug issues"""
-    token = request.session.get('token')
-    if not token:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    
-    try:
-        # First check if it's a React project
-        react_check = await check_if_react_project(request, owner, repo)
-        if not react_check["is_react"]:
-            return {
-                "valid": False,
-                "error": "Not a React project",
-                "react_check": react_check
-            }
-        
-        # Download and validate the actual project
-        headers = {'Authorization': f'token {token["access_token"]}'}
-        
-        # Get package.json content
-        project_path = react_check.get("project_path", "")
-        if project_path:
-            package_json_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{project_path}/package.json'
-        else:
-            package_json_url = f'https://api.github.com/repos/{owner}/{repo}/contents/package.json'
-        
-        response = requests.get(package_json_url, headers=headers)
-        if response.status_code != 200:
-            return JSONResponse({
-                "valid": False,
-                "error": "Could not fetch package.json"
-            }, status_code=400)
-        
-        content = response.json()
-        if content.get("encoding") == "base64":
-            package_json_content = base64.b64decode(content['content']).decode('utf-8')
-            package_data = json.loads(package_json_content)
-            
-            dependencies = package_data.get('dependencies', {})
-            dev_dependencies = package_data.get('devDependencies', {})
-            scripts = package_data.get('scripts', {})
-            
-            # Detailed validation
-            validation_results = {
-                "valid": True,
-                "project_path": project_path,
-                "package_json_url": package_json_url,
-                "react_check": react_check,
-                "validation": {
-                    "has_react": 'react' in dependencies or 'react' in dev_dependencies,
-                    "has_build_script": 'build' in scripts,
-                    "has_start_script": 'start' in scripts,
-                    "build_script": scripts.get('build', 'Not found'),
-                    "start_script": scripts.get('start', 'Not found'),
-                    "project_type": react_check.get("details", {}).get("project_type", "Unknown"),
-                    "dependencies": list(dependencies.keys())[:10],
-                    "dev_dependencies": list(dev_dependencies.keys())[:10],
-                    "total_dependencies": len(dependencies),
-                    "total_dev_dependencies": len(dev_dependencies)
-                },
-                "warnings": [],
-                "recommendations": []
-            }
-            
-            # Add warnings and recommendations
-            if 'build' not in scripts:
-                validation_results["valid"] = False
-                validation_results["warnings"].append("No build script found in package.json")
-                validation_results["recommendations"].append("Add a build script to package.json")
-            
-            if len(dependencies) == 0:
-                validation_results["warnings"].append("No dependencies found")
-                validation_results["recommendations"].append("Ensure all required dependencies are listed")
-            
-            if 'react' not in dependencies and 'react' not in dev_dependencies:
-                validation_results["valid"] = False
-                validation_results["warnings"].append("React not found in dependencies")
-            
-            return validation_results
-        
-        return JSONResponse({
-            "valid": False,
-            "error": "Could not decode package.json content"
-        }, status_code=400)
-        
-    except Exception as e:
-        return JSONResponse({
-            "valid": False,
-            "error": str(e)
-        }, status_code=500)
-
-@project_router.post("/test-build/{owner}/{repo}")
-async def test_build_repository(request: Request, owner: str, repo: str):
-    """Test build with enhanced debugging - downloads and validates without full Docker build"""
-    token = request.session.get('token')
-    if not token:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    
-    # Check if it's a React project first
-    react_check = await check_if_react_project(request, owner, repo)
-    if not react_check["is_react"]:
-        return JSONResponse({
-            "success": False,
-            "error": "Not a React project",
-            "react_check": react_check
-        }, status_code=400)
-    
-    project_path = react_check.get("project_path", "")
-    
-    try:
-        headers = {'Authorization': f'token {token["access_token"]}'}
-        zip_url = f'https://api.github.com/repos/{owner}/{repo}/zipball'
-        
-        response = requests.get(zip_url, headers=headers)
-        if response.status_code != 200:
-            return JSONResponse({
-                "success": False, 
-                "error": "Failed to download repository"
-            }, status_code=400)
-        
-        with tempfile.TemporaryDirectory() as temp_dir:
-            zip_path = os.path.join(temp_dir, f"{repo}.zip")
-            extract_path = os.path.join(temp_dir, "extracted")
-            
-            with open(zip_path, 'wb') as f:
-                f.write(response.content)
-            
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_path)
-            
-            extracted_folders = os.listdir(extract_path)
-            if not extracted_folders:
-                return JSONResponse({
-                    "success": False, 
-                    "error": "No files extracted"
-                }, status_code=400)
-            
-            repo_base_path = os.path.join(extract_path, extracted_folders[0])
-            
-            if project_path:
-                repo_path = os.path.join(repo_base_path, project_path)
-            else:
-                repo_path = repo_base_path
-            
-            if not os.path.exists(repo_path):
-                return JSONResponse({
-                    "success": False,
-                    "error": f"Project path not found: {project_path}"
-                }, status_code=400)
-            
-            # Detailed analysis
-            analysis = {
-                "repository": f"{owner}/{repo}",
-                "project_path": project_path or "root",
-                "react_check": react_check,
-                "validation": {},
-                "file_structure": {},
-                "package_analysis": {},
-                "potential_issues": [],
-                "recommendations": []
-            }
-            
-            # Validate React project
-            validation = await validate_react_project(repo_path)
-            analysis["validation"] = validation
-            
-            # Analyze file structure
-            analysis["file_structure"] = {
-                "has_src": os.path.exists(os.path.join(repo_path, "src")),
-                "has_public": os.path.exists(os.path.join(repo_path, "public")),
-                "has_index_html": os.path.exists(os.path.join(repo_path, "public", "index.html")),
-                "has_tsconfig": os.path.exists(os.path.join(repo_path, "tsconfig.json")),
-                "has_eslint": any(os.path.exists(os.path.join(repo_path, f)) for f in [".eslintrc.js", ".eslintrc.json", ".eslintrc.yaml"]),
-                "has_gitignore": os.path.exists(os.path.join(repo_path, ".gitignore")),
-                "root_files": os.listdir(repo_path) if os.path.exists(repo_path) else []
-            }
-            
-            # Check for entry points
-            entry_points = []
-            for entry in ["src/index.js", "src/index.tsx", "src/index.ts", "src/main.js", "src/main.tsx", "src/App.js", "src/App.tsx"]:
-                if os.path.exists(os.path.join(repo_path, entry)):
-                    entry_points.append(entry)
-            analysis["file_structure"]["entry_points"] = entry_points
-            
-            # Analyze package.json in detail
-            package_json_path = os.path.join(repo_path, "package.json")
-            if os.path.exists(package_json_path):
-                try:
-                    with open(package_json_path, 'r', encoding='utf-8') as f:
-                        package_data = json.load(f)
-                    
-                    dependencies = package_data.get('dependencies', {})
-                    dev_dependencies = package_data.get('devDependencies', {})
-                    scripts = package_data.get('scripts', {})
-                    
-                    analysis["package_analysis"] = {
-                        "name": package_data.get('name', 'unknown'),
-                        "version": package_data.get('version', 'unknown'),
-                        "main": package_data.get('main', ''),
-                        "homepage": package_data.get('homepage', ''),
-                        "scripts": scripts,
-                        "dependencies": dependencies,
-                        "dev_dependencies": dev_dependencies,
-                        "react_version": dependencies.get('react', dev_dependencies.get('react', 'not found')),
-                        "typescript": '@types/react' in dev_dependencies or 'typescript' in dev_dependencies,
-                        "build_tools": {
-                            "react_scripts": 'react-scripts' in dependencies or 'react-scripts' in dev_dependencies,
-                            "vite": 'vite' in dependencies or 'vite' in dev_dependencies,
-                            "webpack": 'webpack' in dependencies or 'webpack' in dev_dependencies,
-                            "parcel": 'parcel' in dependencies or 'parcel' in dev_dependencies
-                        }
-                    }
-                    
-                    # Check for potential issues
-                    if not analysis["file_structure"]["has_src"]:
-                        analysis["potential_issues"].append("No 'src' directory found")
-                        analysis["recommendations"].append("Ensure your React source code is in a 'src' directory")
-                    
-                    if not analysis["file_structure"]["entry_points"]:
-                        analysis["potential_issues"].append("No main entry point found")
-                        analysis["recommendations"].append("Create src/index.js or src/index.tsx as your main entry point")
-                    
-                    if not analysis["file_structure"]["has_public"]:
-                        analysis["potential_issues"].append("No 'public' directory found")
-                        analysis["recommendations"].append("Create a 'public' directory with index.html")
-                    
-                    if not analysis["file_structure"]["has_index_html"]:
-                        analysis["potential_issues"].append("No index.html found in public directory")
-                        analysis["recommendations"].append("Add index.html to your public directory")
-                    
-                    if 'build' not in scripts:
-                        analysis["potential_issues"].append("No build script in package.json")
-                        analysis["recommendations"].append("Add a build script to package.json")
-                    
-                    if len(dependencies) == 0:
-                        analysis["potential_issues"].append("No dependencies found")
-                        analysis["recommendations"].append("Install React and other required dependencies")
-                    
-                    # Check for version conflicts
-                    if 'react' in dependencies:
-                        react_version = dependencies['react']
-                        if '^18' not in react_version and '^17' not in react_version and '^16' not in react_version:
-                            analysis["potential_issues"].append(f"Unusual React version: {react_version}")
-                    
-                except Exception as e:
-                    analysis["potential_issues"].append(f"Error reading package.json: {str(e)}")
-            
-            return {
-                "success": True,
-                "analysis": analysis,
-                "ready_to_build": len(analysis["potential_issues"]) == 0,
-                "issue_count": len(analysis["potential_issues"])
-            }
-            
     except Exception as e:
         return JSONResponse({
             "success": False,
@@ -650,7 +590,6 @@ async def build_react_project(request: Request, owner: str, repo: str):
             
             print(f"Project validation passed: {validation['project_type']}")
             
-            await modify_package_json_for_relative_paths(repo_path)
             await fix_node_compatibility_issues(repo_path)
             
             build_result = await build_react_in_docker(repo_path, build_output, owner, repo)
@@ -691,8 +630,6 @@ async def build_react_project(request: Request, owner: str, repo: str):
                         static_server_dir = os.path.join(server_build_dir, "static")
                         os.makedirs(static_server_dir, exist_ok=True)
                         shutil.copytree(static_folder, static_server_dir, dirs_exist_ok=True)
-                    
-                    await fix_index_html_paths(s3_source_folder)
                 
                 s3_prefix = f"projects/{owner}/{repo}"
                 print(f"Starting S3 upload from {s3_source_folder} to {s3_prefix}")
@@ -829,89 +766,6 @@ async def get_s3_hosting_info(request: Request, owner: str, repo: str):
             "success": False
         }, status_code=500)
 
-@project_router.get("/debug-s3/{owner}/{repo}")
-async def debug_s3_project(request: Request, owner: str, repo: str):
-    token = request.session.get('token')
-    if not token:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    
-    if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
-        return JSONResponse({
-            "error": "S3 not configured",
-            "configured": False
-        }, status_code=400)
-    
-    s3_prefix = f"projects/{owner}/{repo}"
-    
-    try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_REGION,
-        )
-        
-        try:
-            bucket_info = s3.get_bucket_location(Bucket=S3_BUCKET_NAME)
-            bucket_region = bucket_info['LocationConstraint'] or "us-east-1"
-        except Exception as e:
-            bucket_region = f"Error: {str(e)}"
-            
-        try:
-            website_config = s3.get_bucket_website(Bucket=S3_BUCKET_NAME)
-        except Exception as e:
-            website_config = f"Not configured as website: {str(e)}"
-        
-        response = s3.list_objects_v2(
-            Bucket=S3_BUCKET_NAME,
-            Prefix=s3_prefix
-        )
-        
-        files = []
-        if 'Contents' in response:
-            for item in response['Contents']:
-                key = item['Key']
-                try:
-                    head = s3.head_object(Bucket=S3_BUCKET_NAME, Key=key)
-                    content_type = head.get('ContentType', 'unknown')
-                except Exception as e:
-                    content_type = f"Error: {str(e)}"
-                
-                file_url = f"{S3_BASE_URL}{key}"
-                files.append({
-                    "key": key,
-                    "url": file_url,
-                    "size": item['Size'],
-                    "content_type": content_type,
-                    "last_modified": item['LastModified'].isoformat()
-                })
-        
-        directories = set()
-        for file in files:
-            path_parts = file["key"].split("/")
-            for i in range(1, len(path_parts)):
-                directories.add("/".join(path_parts[:i]))
-        
-        return {
-            "owner": owner,
-            "repo": repo,
-            "s3_bucket": S3_BUCKET_NAME,
-            "s3_region": bucket_region,
-            "s3_website_config": website_config,
-            "s3_base_url": S3_BASE_URL,
-            "file_count": len(files),
-            "files": files,
-            "has_index": any(f["key"].endswith("index.html") for f in files),
-            "has_static_folder": any("/static/" in f["key"] for f in files),
-            "has_assets_folder": any("/assets/" in f["key"] for f in files),
-            "directories": sorted(list(directories))
-        }
-    except Exception as e:
-        return JSONResponse({
-            "error": str(e),
-            "success": False
-        }, status_code=500)
-
 @project_router.delete("/builds/{build_id}")
 async def delete_build(request: Request, build_id: str):
     
@@ -929,204 +783,257 @@ async def delete_build(request: Request, build_id: str):
     else:
         return JSONResponse({"success": False, "error": "Build not found"}, status_code=404)
 
-
-@project_router.get("/debug-blank-page/{owner}/{repo}")
-async def debug_blank_page_issue(request: Request, owner: str, repo: str):
-    """Debug why a deployed React app shows a blank page"""
+@project_router.post("/run-backend/{owner}/{repo}")
+async def run_backend_project(request: Request, owner: str, repo: str):
+    """Run a backend project (Node.js or Python) in a Docker container"""
     token = request.session.get('token')
     if not token:
         return JSONResponse({"error": "Not authenticated"}, status_code=401)
     
-    if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
+    if not docker_client:
         return JSONResponse({
-            "error": "S3 not configured",
-            "configured": False
+            "success": False,
+            "error": "Docker Desktop needs to be installed and running"
         }, status_code=400)
     
-    s3_prefix = f"projects/{owner}/{repo}"
+    # Check if it's a backend project
+    backend_check = await check_if_backend_project(request, owner, repo)
+    if not backend_check["is_backend"]:
+        return JSONResponse({
+            "success": False,
+            "error": "This project is not a backend project"
+        }, status_code=400)
+    
+    project_path = backend_check.get("project_path", "")
+    backend_type = backend_check["backend_type"]
+    
+    # Check if already running
+    container_key = f"{owner}_{repo}"
+    if container_key in running_backend_containers:
+        container_info = running_backend_containers[container_key]
+        try:
+            container = docker_client.containers.get(container_info["container_id"])
+            if container.status == "running":
+                return {
+                    "success": True,
+                    "message": "Backend is already running",
+                    "container_id": container_info["container_id"],
+                    "local_url": container_info["local_url"],
+                    "port": container_info["port"],
+                    "backend_type": backend_type
+                }
+        except:
+            # Container doesn't exist anymore, remove from tracking
+            del running_backend_containers[container_key]
     
     try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_REGION,
-        )
+        # Download and extract repository
+        headers = {'Authorization': f'token {token["access_token"]}'}
+        zip_url = f'https://api.github.com/repos/{owner}/{repo}/zipball'
         
-        # Get all files
-        response = s3.list_objects_v2(
-            Bucket=S3_BUCKET_NAME,
-            Prefix=s3_prefix
-        )
+        response = requests.get(zip_url, headers=headers)
+        if response.status_code != 200:
+            return JSONResponse({"success": False, "error": "Failed to download repository"}, status_code=400)
         
-        debug_info = {
-            "owner": owner,
-            "repo": repo,
-            "s3_prefix": s3_prefix,
-            "issues_found": [],
-            "recommendations": [],
-            "files_analysis": {},
-            "index_html_analysis": {},
-            "static_files_analysis": {}
-        }
-        
-        if 'Contents' not in response:
-            debug_info["issues_found"].append("No files found in S3")
-            debug_info["recommendations"].append("Build and deploy the project first")
-            return debug_info
-        
-        files = response['Contents']
-        file_keys = [item['Key'] for item in files]
-        
-        # Check for index.html
-        index_key = f"{s3_prefix}/index.html"
-        has_index = index_key in file_keys
-        
-        if not has_index:
-            debug_info["issues_found"].append("No index.html found in S3")
-            debug_info["recommendations"].append("Ensure your React build creates an index.html file")
-        else:
-            # Analyze index.html content
-            try:
-                index_obj = s3.get_object(Bucket=S3_BUCKET_NAME, Key=index_key)
-                index_content = index_obj['Body'].read().decode('utf-8')
+        with tempfile.TemporaryDirectory() as temp_dir:
+            zip_path = os.path.join(temp_dir, f"{repo}.zip")
+            extract_path = os.path.join(temp_dir, "extracted")
+            
+            with open(zip_path, 'wb') as f:
+                f.write(response.content)
+            
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_path)
+            
+            extracted_folders = os.listdir(extract_path)
+            if not extracted_folders:
+                return JSONResponse({"success": False, "error": "No files extracted"}, status_code=400)
+            
+            repo_base_path = os.path.join(extract_path, extracted_folders[0])
+            
+            if project_path:
+                repo_path = os.path.join(repo_base_path, project_path)
+            else:
+                repo_path = repo_base_path
+            
+            if not os.path.exists(repo_path):
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Project path not found: {project_path}"
+                }, status_code=400)
+            
+            # Find available port
+            import socket
+            def find_free_port():
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.bind(('', 0))
+                    s.listen(1)
+                    port = s.getsockname()[1]
+                return port
+            
+            port = find_free_port()
+            
+            # Run the appropriate container
+            if backend_type == "nodejs":
+                container = await run_nodejs_container(repo_path, port, owner, repo)
+            elif backend_type == "python":
+                container = await run_python_container(repo_path, port, owner, repo)
+            else:
+                return JSONResponse({
+                    "success": False,
+                    "error": f"Unsupported backend type: {backend_type}"
+                }, status_code=400)
+            
+            if container:
+                local_url = f"http://localhost:{port}"
                 
-                debug_info["index_html_analysis"] = {
-                    "size": len(index_content),
-                    "content_type": index_obj.get('ContentType', 'unknown'),
-                    "has_react_root": 'id="root"' in index_content or "id='root'" in index_content,
-                    "has_scripts": '<script' in index_content,
-                    "has_stylesheets": '<link' in index_content and 'stylesheet' in index_content,
-                    "preview": index_content[:300] + "..." if len(index_content) > 300 else index_content,
-                    "absolute_paths_count": index_content.count('="/')
+                # Track the running container
+                running_backend_containers[container_key] = {
+                    "container_id": container.id,
+                    "port": port,
+                    "local_url": local_url,
+                    "backend_type": backend_type,
+                    "owner": owner,
+                    "repo": repo,
+                    "started_at": time.time()
                 }
                 
-                if len(index_content.strip()) < 100:
-                    debug_info["issues_found"].append("index.html is very small - possibly corrupted")
-                    debug_info["recommendations"].append("Rebuild the project - the build may have failed")
+                # Start a thread to monitor container status
+                def monitor_container():
+                    try:
+                        container.wait()
+                    except:
+                        pass
+                    finally:
+                        cleanup_container(container.id)
                 
-                if not debug_info["index_html_analysis"]["has_react_root"]:
-                    debug_info["issues_found"].append("No React root div found in index.html")
-                    debug_info["recommendations"].append("Ensure your index.html has <div id='root'></div>")
+                threading.Thread(target=monitor_container, daemon=True).start()
                 
-                if not debug_info["index_html_analysis"]["has_scripts"]:
-                    debug_info["issues_found"].append("No JavaScript files linked in index.html")
-                    debug_info["recommendations"].append("React build should include script tags for JS bundles")
+                return {
+                    "success": True,
+                    "message": f"Backend {owner}/{repo} is now running",
+                    "container_id": container.id,
+                    "local_url": local_url,
+                    "port": port,
+                    "backend_type": backend_type
+                }
+            else:
+                return JSONResponse({
+                    "success": False,
+                    "error": "Failed to start container"
+                }, status_code=500)
                 
-                if debug_info["index_html_analysis"]["absolute_paths_count"] > 0:
-                    debug_info["issues_found"].append(f"Found {debug_info['index_html_analysis']['absolute_paths_count']} absolute paths in index.html")
-                    debug_info["recommendations"].append("Fix absolute paths to relative paths for S3 hosting")
-                
-            except Exception as e:
-                debug_info["issues_found"].append(f"Could not read index.html content: {str(e)}")
-        
-        # Check for static/assets folders
-        static_files = [key for key in file_keys if '/static/' in key or '/assets/' in key]
-        js_files = [key for key in file_keys if key.endswith('.js')]
-        css_files = [key for key in file_keys if key.endswith('.css')]
-        
-        debug_info["static_files_analysis"] = {
-            "static_files_count": len(static_files),
-            "js_files_count": len(js_files),
-            "css_files_count": len(css_files),
-            "js_files": js_files[:5],  # Show first 5
-            "css_files": css_files[:5]  # Show first 5
-        }
-        
-        if len(js_files) == 0:
-            debug_info["issues_found"].append("No JavaScript files found")
-            debug_info["recommendations"].append("React build should create JS bundle files")
-        
-        if len(css_files) == 0:
-            debug_info["issues_found"].append("No CSS files found")
-            debug_info["recommendations"].append("Consider if your app should have CSS files")
-        
-        # Check S3 website configuration
-        try:
-            website_config = s3.get_bucket_website(Bucket=S3_BUCKET_NAME)
-            debug_info["s3_website_config"] = website_config
-            
-            error_doc = website_config.get('ErrorDocument', {}).get('Key')
-            if error_doc != 'index.html':
-                debug_info["issues_found"].append(f"S3 ErrorDocument is '{error_doc}', should be 'index.html' for SPA routing")
-                debug_info["recommendations"].append("Configure S3 ErrorDocument to 'index.html' for React Router")
-                
-        except Exception as e:
-            debug_info["issues_found"].append("S3 bucket not configured for website hosting")
-            debug_info["recommendations"].append("Enable S3 static website hosting with ErrorDocument=index.html")
-        
-        # Generate S3 URLs for testing
-        s3_base_url = f"{S3_BASE_URL}projects/{owner}/{repo}/"
-        debug_info["test_urls"] = {
-            "direct_s3_url": s3_base_url,
-            "index_html_url": f"{s3_base_url}index.html",
-            "sample_js_url": f"{s3_base_url}{js_files[0].split('/')[-1]}" if js_files else None,
-            "sample_css_url": f"{s3_base_url}{css_files[0].split('/')[-1]}" if css_files else None
-        }
-        
-        # Overall assessment
-        debug_info["severity"] = "high" if len(debug_info["issues_found"]) > 3 else "medium" if len(debug_info["issues_found"]) > 0 else "low"
-        debug_info["total_issues"] = len(debug_info["issues_found"])
-        
-        return debug_info
-        
-    except Exception as e:
-        return JSONResponse({
-            "error": str(e),
-            "success": False
-        }, status_code=500)
-
-@project_router.post("/setup-s3-website")
-async def setup_s3_website(request: Request):
-    token = request.session.get('token')
-    if not token:
-        return JSONResponse({"error": "Not authenticated"}, status_code=401)
-    
-    if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
-        return JSONResponse({
-            "error": "S3 not configured",
-            "configured": False
-        }, status_code=400)
-    
-    try:
-        s3 = boto3.client(
-            "s3",
-            aws_access_key_id=AWS_ACCESS_KEY_ID,
-            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
-            region_name=AWS_REGION,
-        )
-        
-        try:
-            website_configuration = {
-                'ErrorDocument': {'Key': 'index.html'},
-                'IndexDocument': {'Suffix': 'index.html'},
-            }
-            
-            s3.put_bucket_website(
-                Bucket=S3_BUCKET_NAME,
-                WebsiteConfiguration=website_configuration
-            )
-            
-            region = s3.get_bucket_location(Bucket=S3_BUCKET_NAME)
-            region_name = region['LocationConstraint'] or 'us-east-1'
-            website_url = f"http://{S3_BUCKET_NAME}.s3-website-{region_name}.amazonaws.com/"
-            
-            return {
-                "success": True,
-                "message": "S3 bucket configured for static website hosting",
-                "website_url": website_url
-            }
-        except Exception as e:
-            return JSONResponse({
-                "success": False,
-                "error": f"Failed to configure website hosting: {str(e)}"
-            }, status_code=500)
-            
     except Exception as e:
         return JSONResponse({
             "success": False,
             "error": str(e)
         }, status_code=500)
+
+@project_router.get("/backend-status")
+async def get_running_backends(request: Request):
+    """Get status of all running backend containers"""
+    token = request.session.get('token')
+    if not token:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    running_backends = []
+    containers_to_remove = []
+    
+    for container_key, container_info in running_backend_containers.items():
+        try:
+            container = docker_client.containers.get(container_info["container_id"])
+            running_backends.append({
+                "owner": container_info["owner"],
+                "repo": container_info["repo"],
+                "container_id": container_info["container_id"],
+                "local_url": container_info["local_url"],
+                "port": container_info["port"],
+                "backend_type": container_info["backend_type"],
+                "status": container.status,
+                "started_at": container_info["started_at"],
+                "uptime": time.time() - container_info["started_at"]
+            })
+        except:
+            # Container doesn't exist anymore
+            containers_to_remove.append(container_key)
+    
+    # Clean up non-existent containers
+    for key in containers_to_remove:
+        del running_backend_containers[key]
+    
+    return {
+        "running_backends": running_backends,
+        "total_running": len(running_backends)
+    }
+
+@project_router.delete("/stop-backend/{owner}/{repo}")
+async def stop_backend_project(request: Request, owner: str, repo: str):
+    """Stop a running backend container"""
+    token = request.session.get('token')
+    if not token:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    container_key = f"{owner}_{repo}"
+    
+    if container_key not in running_backend_containers:
+        return JSONResponse({
+            "success": False,
+            "error": "Backend is not running"
+        }, status_code=404)
+    
+    try:
+        container_info = running_backend_containers[container_key]
+        container = docker_client.containers.get(container_info["container_id"])
+        container.stop(timeout=10)
+        container.remove()
+        
+        del running_backend_containers[container_key]
+        
+        return {
+            "success": True,
+            "message": f"Backend {owner}/{repo} stopped successfully"
+        }
+        
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
+
+@project_router.get("/backend-logs/{owner}/{repo}")
+async def get_backend_logs(request: Request, owner: str, repo: str):
+    """Get logs from a running backend container"""
+    token = request.session.get('token')
+    if not token:
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    
+    container_key = f"{owner}_{repo}"
+    
+    if container_key not in running_backend_containers:
+        return JSONResponse({
+            "success": False,
+            "error": "Backend is not running"
+        }, status_code=404)
+    
+    try:
+        container_info = running_backend_containers[container_key]
+        container = docker_client.containers.get(container_info["container_id"])
+        
+        logs = container.logs(tail=100).decode('utf-8')
+        
+        return {
+            "success": True,
+            "logs": logs.split('\n'),
+            "container_id": container_info["container_id"],
+            "backend_type": container_info["backend_type"]
+        }
+        
+    except Exception as e:
+        return JSONResponse({
+            "success": False,
+            "error": str(e)
+        }, status_code=500)
+
 
 def upload_folder_to_s3(local_folder, s3_prefix):
     if not AWS_ACCESS_KEY_ID or not AWS_SECRET_ACCESS_KEY or not S3_BUCKET_NAME:
@@ -1196,7 +1103,6 @@ def upload_folder_to_s3(local_folder, s3_prefix):
                         "ContentType": content_type
                     }
                     
-                    # Add cache control headers
                     if lower_file.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2")):
                         extra_args["CacheControl"] = "public, max-age=31536000"  # 1 year for assets
                     elif lower_file.endswith(".html"):
@@ -1223,205 +1129,6 @@ async def is_react_project(request: Request, owner: str, repo: str):
     """Simple React project check - now just calls the deeper check function"""
     react_check = await check_if_react_project(request, owner, repo)
     return react_check.get("is_react", False)
-
-async def fix_index_html_paths(folder_path):
-    """Enhanced index.html path fixing with comprehensive debugging"""
-    index_path = os.path.join(folder_path, "index.html")
-    if not os.path.exists(index_path):
-        print(f"❌ No index.html found in {folder_path}")
-        # List files in the directory to debug
-        if os.path.exists(folder_path):
-            files = os.listdir(folder_path)
-            print(f"Files in {folder_path}: {files}")
-        return False
-        
-    try:
-        with open(index_path, 'r', encoding='utf-8') as f:
-            original_content = f.read()
-        
-        html_content = original_content
-        
-        print(f"📄 Original index.html content preview:")
-        print(f"Length: {len(original_content)} characters")
-        print(f"First 200 chars: {original_content[:200]}")
-        
-        # Check if it's actually empty or has minimal content
-        if len(original_content.strip()) < 100:
-            print("⚠️  WARNING: index.html seems very short - possibly corrupted build")
-            
-        # More comprehensive path fixing
-        changes_made = []
-        
-        # Fix static asset paths
-        if 'src="/static/' in html_content:
-            html_content = html_content.replace('src="/static/', 'src="./static/')
-            changes_made.append("Fixed src static paths")
-            
-        if 'href="/static/' in html_content:
-            html_content = html_content.replace('href="/static/', 'href="./static/')
-            changes_made.append("Fixed href static paths")
-            
-        if 'src="/assets/' in html_content:
-            html_content = html_content.replace('src="/assets/', 'src="./assets/')
-            changes_made.append("Fixed src assets paths")
-            
-        if 'href="/assets/' in html_content:
-            html_content = html_content.replace('href="/assets/', 'href="./assets/')
-            changes_made.append("Fixed href assets paths")
-        
-        # Fix any remaining absolute paths (but be careful not to break external URLs)
-        import re
-        # Only fix paths that start with / but aren't URLs
-        pattern = r'(src|href)="(/[^"]*?)"'
-        def fix_path(match):
-            attr, path = match.groups()
-            # Don't fix external URLs or data URLs
-            if path.startswith(('http', 'https', 'data:', 'mailto:', 'tel:')):
-                return match.group(0)
-            # Fix local absolute paths
-            return f'{attr}=".{path}"'
-        
-        new_content = re.sub(pattern, fix_path, html_content)
-        if new_content != html_content:
-            html_content = new_content
-            changes_made.append("Fixed remaining absolute paths")
-        
-        # Add or fix base tag for SPA routing
-        if '<base href="/">' in html_content:
-            html_content = html_content.replace('<base href="/">', '<base href="./">')
-            changes_made.append("Updated base href to relative")
-        elif '<head>' in html_content and '<base href="./">' not in html_content:
-            html_content = html_content.replace('<head>', '<head>\n    <base href="./">')
-            changes_made.append("Added relative base href")
-        
-        # Ensure React root div exists
-        if 'id="root"' not in html_content and 'id=\'root\'' not in html_content:
-            print("⚠️  WARNING: No React root div found - this might cause blank page")
-            
-        # Write the fixed content
-        with open(index_path, 'w', encoding='utf-8') as f:
-            f.write(html_content)
-            
-        print(f"✅ Fixed index.html paths - Changes made: {changes_made}")
-        print(f"📄 Updated content preview:")
-        print(f"Length: {len(html_content)} characters")
-        print(f"First 200 chars: {html_content[:200]}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error fixing index.html paths: {str(e)}")
-        return False
-
-async def modify_package_json_for_relative_paths(repo_path):
-    """Fix both relative paths AND SPA routing for React projects"""
-    package_json_path = os.path.join(repo_path, "package.json")
-    if not os.path.exists(package_json_path):
-        print("package.json not found, skipping modification")
-        return False
-    
-    try:
-        # Read and modify package.json
-        with open(package_json_path, 'r', encoding='utf-8') as f:
-            package_data = json.load(f)
-        
-        # Set homepage for relative paths
-        package_data["homepage"] = "."
-        
-        # Write back package.json
-        with open(package_json_path, 'w', encoding='utf-8') as f:
-            json.dump(package_data, f, indent=2)
-        
-        print("✅ Modified package.json homepage to '.'")
-        
-        # Handle different project types
-        dependencies = package_data.get('dependencies', {})
-        dev_dependencies = package_data.get('devDependencies', {})
-        is_cra = 'react-scripts' in dependencies or 'react-scripts' in dev_dependencies
-        is_vite = 'vite' in dependencies or 'vite' in dev_dependencies
-        
-        if is_vite:
-            await fix_vite_config_for_spa(repo_path)
-        
-        if is_cra:
-            await create_redirects_for_cra(repo_path)
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error modifying package.json: {str(e)}")
-        return False
-
-async def fix_vite_config_for_spa(repo_path):
-    """Fix Vite config for SPA routing and relative paths with version compatibility"""
-    vite_config_candidates = [
-        os.path.join(repo_path, "vite.config.js"),
-        os.path.join(repo_path, "vite.config.ts")
-    ]
-    
-    vite_config_path = None
-    for candidate in vite_config_candidates:
-        if os.path.exists(candidate):
-            vite_config_path = candidate
-            break
-    
-    if not vite_config_path:
-        # Create a new vite config if none exists
-        vite_config_path = os.path.join(repo_path, "vite.config.js")
-    
-    try:
-        # Create a proper Vite config that handles SPA routing and Node compatibility
-        new_config = '''import { defineConfig } from 'vite'
-import react from '@vitejs/plugin-react'
-
-export default defineConfig({
-  base: "./",
-  plugins: [react()],
-  build: {
-    outDir: 'dist',
-    assetsDir: 'assets',
-    // Ensure compatibility with older Node versions
-    target: 'es2015',
-    sourcemap: false
-  },
-  // Handle potential crypto issues
-  define: {
-    global: 'globalThis',
-  },
-  optimizeDeps: {
-    include: ['react', 'react-dom']
-  }
-})
-'''
-        
-        with open(vite_config_path, 'w', encoding='utf-8') as f:
-            f.write(new_config)
-        
-        print("✅ Created compatible Vite config with SPA support")
-        return True
-        
-    except Exception as e:
-        print(f"Error fixing Vite config: {str(e)}")
-        return False
-
-async def create_redirects_for_cra(repo_path):
-    """Create redirects file for Create React App SPA routing"""
-    try:
-        public_dir = os.path.join(repo_path, "public")
-        if not os.path.exists(public_dir):
-            os.makedirs(public_dir)
-        
-        # Create _redirects file for Netlify-style hosting
-        redirects_path = os.path.join(public_dir, "_redirects")
-        with open(redirects_path, 'w') as f:
-            f.write("/*    /index.html   200\n")
-        
-        print("✅ Created _redirects file for SPA routing")
-        return True
-        
-    except Exception as e:
-        print(f"Error creating redirect files: {str(e)}")
-        return False
 
 async def fix_node_compatibility_issues(repo_path):
     """Fix Node.js compatibility issues for modern React projects"""
@@ -1468,50 +1175,6 @@ async def fix_node_compatibility_issues(repo_path):
         print(f"Error fixing Node compatibility: {str(e)}")
         return False
 
-async def fix_node_compatibility_issues(repo_path):
-    """Fix Node.js compatibility issues for modern React projects"""
-    package_json_path = os.path.join(repo_path, "package.json")
-    if not os.path.exists(package_json_path):
-        return False
-    
-    try:
-        with open(package_json_path, 'r', encoding='utf-8') as f:
-            package_data = json.load(f)
-        
-        dependencies = package_data.get('dependencies', {})
-        dev_dependencies = package_data.get('devDependencies', {})
-        
-        # Check if using problematic Vite version
-        vite_version = dev_dependencies.get('vite', dependencies.get('vite', ''))
-        
-        changes_made = []
-        
-        # If using Vite 7.x which requires Node 20+, add engine requirements
-        if vite_version and ('7.' in vite_version or '^7' in vite_version):
-            if 'engines' not in package_data:
-                package_data['engines'] = {}
-            package_data['engines']['node'] = '>=20.0.0'
-            changes_made.append("Added Node.js engine requirement")
-        
-        # Add legacy-peer-deps option for npm compatibility
-        npmrc_path = os.path.join(repo_path, '.npmrc')
-        with open(npmrc_path, 'w') as f:
-            f.write("legacy-peer-deps=true\n")
-            f.write("fund=false\n")
-        changes_made.append("Created .npmrc for compatibility")
-        
-        if changes_made:
-            with open(package_json_path, 'w', encoding='utf-8') as f:
-                json.dump(package_data, f, indent=2)
-            
-            print(f"✅ Fixed Node compatibility - Changes: {changes_made}")
-        
-        return True
-        
-    except Exception as e:
-        print(f"Error fixing Node compatibility: {str(e)}")
-        return False
-
 async def configure_s3_for_spa_routing():
     """Configure S3 bucket for SPA routing - crucial for React Router"""
     if not all([AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, S3_BUCKET_NAME]):
@@ -1544,6 +1207,131 @@ async def configure_s3_for_spa_routing():
         print(f"Error configuring S3 for SPA: {str(e)}")
         return False
 
+
+async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str):
+   
+    try:
+        abs_repo_path = os.path.abspath(repo_path)
+        
+        # Detect the start command
+        package_json_path = os.path.join(repo_path, "package.json")
+        start_command = "npm start"
+        
+        if os.path.exists(package_json_path):
+            with open(package_json_path, 'r', encoding='utf-8') as f:
+                package_data = json.load(f)
+                scripts = package_data.get('scripts', {})
+                
+                if 'dev' in scripts:
+                    start_command = "npm run dev"
+                elif 'start' in scripts:
+                    start_command = "npm start"
+                else:
+                    start_command = "node index.js"  # fallback
+        
+        # Docker command to run Node.js app
+        run_command = f"""
+        set -e
+        echo "🚀 Starting Node.js backend..."
+        echo "Installing dependencies..."
+        npm install --production
+        echo "Starting application with: {start_command}"
+        {start_command}
+        """
+        
+        container = docker_client.containers.run(
+            "node:18-alpine",
+            command=["sh", "-c", run_command],
+            volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
+            working_dir='/app',
+            ports={f'{port}/tcp': port},
+            environment={
+                'NODE_ENV': 'development',
+                'PORT': str(port)
+            },
+            detach=True,
+            
+            name=f"backend_{owner}_{repo}_{port}"
+        )
+        
+        print(f"✅ Started Node.js container {container.id} on port {port}")
+        return container
+        
+    except Exception as e:
+        print(f"❌ Error starting Node.js container: {str(e)}")
+        return None
+
+async def run_python_container(repo_path: str, port: int, owner: str, repo: str):
+    """Run Python backend in Docker container"""
+    try:
+        abs_repo_path = os.path.abspath(repo_path)
+        
+        # Detect Python entry point and framework
+        start_command = "python app.py"
+        
+        # Check for common Python entry files
+        if os.path.exists(os.path.join(repo_path, "main.py")):
+            start_command = "python main.py"
+        elif os.path.exists(os.path.join(repo_path, "server.py")):
+            start_command = "python server.py"
+        elif os.path.exists(os.path.join(repo_path, "app.py")):
+            start_command = "python app.py"
+        elif os.path.exists(os.path.join(repo_path, "wsgi.py")):
+            start_command = "gunicorn wsgi:app --bind 0.0.0.0:8000"
+        elif os.path.exists(os.path.join(repo_path, "asgi.py")):
+            start_command = "uvicorn asgi:app --host 0.0.0.0 --port 8000"
+        
+        # Check requirements.txt for framework detection
+        requirements_path = os.path.join(repo_path, "requirements.txt")
+        if os.path.exists(requirements_path):
+            with open(requirements_path, 'r') as f:
+                requirements = f.read().lower()
+                if 'fastapi' in requirements:
+                    if os.path.exists(os.path.join(repo_path, "main.py")):
+                        start_command = f"uvicorn main:app --host 0.0.0.0 --port {port} --reload"
+                    elif os.path.exists(os.path.join(repo_path, "app.py")):
+                        start_command = f"uvicorn app:app --host 0.0.0.0 --port {port} --reload"
+                elif 'flask' in requirements:
+                    start_command = f"python -m flask run --host 0.0.0.0 --port {port}"
+                elif 'django' in requirements:
+                    start_command = f"python manage.py runserver 0.0.0.0:{port}"
+        
+        # Docker command to run Python app
+        run_command = f"""
+        set -e
+        echo "🐍 Starting Python backend..."
+        echo "Installing dependencies..."
+        if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+        else
+            echo "No requirements.txt found, proceeding without dependencies"
+        fi
+        echo "Starting application with: {start_command}"
+        {start_command}
+        """
+        
+        container = docker_client.containers.run(
+            "python:3.11-alpine",
+            command=["sh", "-c", run_command],
+            volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
+            working_dir='/app',
+            ports={f'{port}/tcp': port},
+            environment={
+                'PYTHONPATH': '/app',
+                'FLASK_ENV': 'development',
+                'FLASK_APP': 'app.py'
+            },
+            detach=True,
+            remove=True,
+            name=f"backend_{owner}_{repo}_{port}"
+        )
+        
+        print(f"✅ Started Python container {container.id} on port {port}")
+        return container
+        
+    except Exception as e:
+        print(f"❌ Error starting Python container: {str(e)}")
+        return None
 
 async def validate_react_project(repo_path: str):
     """Validate React project before building"""
