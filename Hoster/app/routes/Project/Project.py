@@ -38,7 +38,7 @@ try:
 except Exception as e:
     print(f"Docker not available: {e}")
 
-# Track running backend containers
+
 running_backend_containers = {}
 
 def cleanup_container(container_id):
@@ -93,7 +93,7 @@ async def check_if_react_project(request: Request, owner: str, repo: str):
     try:
         headers = {'Authorization': f'token {token["access_token"]}'}
         
-        # First check root level
+        
         is_react_root = await check_react_in_directory(headers, owner, repo, "")
         if is_react_root["is_react"]:
             return {
@@ -103,7 +103,7 @@ async def check_if_react_project(request: Request, owner: str, repo: str):
                 "details": is_react_root["details"]
             }
         
-        # If not found at root, check subdirectories
+        
         try:
             contents_url = f'https://api.github.com/repos/{owner}/{repo}/contents'
             contents_response = requests.get(contents_url, headers=headers)
@@ -111,7 +111,7 @@ async def check_if_react_project(request: Request, owner: str, repo: str):
             if contents_response.status_code == 200:
                 contents = contents_response.json()
                 
-                # Check each directory in the root
+                
                 for item in contents:
                     if item['type'] == 'dir':
                         folder_name = item['name']
@@ -211,7 +211,7 @@ async def check_if_backend_project(request: Request, owner: str, repo: str):
     try:
         headers = {'Authorization': f'token {token["access_token"]}'}
         
-        # Check root level first
+        
         backend_check_root = await check_backend_in_directory(headers, owner, repo, "")
         if backend_check_root["is_backend"]:
             return {
@@ -221,7 +221,7 @@ async def check_if_backend_project(request: Request, owner: str, repo: str):
                 "details": backend_check_root["details"]
             }
         
-        # Check subdirectories
+        
         try:
             contents_url = f'https://api.github.com/repos/{owner}/{repo}/contents'
             contents_response = requests.get(contents_url, headers=headers)
@@ -266,7 +266,7 @@ async def check_backend_in_directory(headers, owner: str, repo: str, directory_p
             "details": {}
         }
         
-        # Check for Node.js project
+        
         if directory_path:
             package_json_url = f'https://api.github.com/repos/{owner}/{repo}/contents/{directory_path}/package.json'
         else:
@@ -283,7 +283,7 @@ async def check_backend_in_directory(headers, owner: str, repo: str, directory_p
                 dev_dependencies = package_data.get('devDependencies', {})
                 scripts = package_data.get('scripts', {})
                 
-                # Check for backend frameworks
+                
                 is_express = 'express' in dependencies
                 is_fastify = 'fastify' in dependencies
                 is_koa = 'koa' in dependencies
@@ -315,12 +315,12 @@ async def check_backend_in_directory(headers, owner: str, repo: str, directory_p
                             "has_start_script": has_start_script,
                             "has_dev_script": 'dev' in scripts,
                             "scripts": list(scripts.keys()),
-                            "dependencies": list(dependencies.keys())[:10]  # Limit for response size
+                            "dependencies": list(dependencies.keys())[:10]  
                         }
                     }
                     return backend_info
         
-        # Check for Python project
+        
         python_files = ['requirements.txt', 'app.py', 'main.py', 'server.py', 'wsgi.py', 'asgi.py']
         for python_file in python_files:
             if directory_path:
@@ -330,10 +330,10 @@ async def check_backend_in_directory(headers, owner: str, repo: str, directory_p
             
             response = requests.get(file_url, headers=headers)
             if response.status_code == 200:
-                # Found a Python backend file
+                
                 framework = "Unknown"
                 
-                # Try to detect framework from requirements.txt
+                
                 if python_file == 'requirements.txt':
                     content = response.json()
                     if content.get("encoding") == "base64":
@@ -419,7 +419,7 @@ async def get_repo_structure(request: Request, owner: str, repo: str):
                 "details": react_check_root["details"]
             })
         
-        # Check for backend projects in root
+        
         backend_check_root = await check_backend_in_directory(headers, owner, repo, "")
         if backend_check_root["is_backend"]:
             structure["backend_projects"].append({
@@ -438,7 +438,7 @@ async def get_repo_structure(request: Request, owner: str, repo: str):
                     "details": react_check_sub["details"]
                 })
             
-            # Check subdirectories for backend projects
+            
             backend_check_sub = await check_backend_in_directory(headers, owner, repo, directory["name"])
             if backend_check_sub["is_backend"]:
                 structure["backend_projects"].append({
@@ -634,7 +634,7 @@ async def build_react_project(request: Request, owner: str, repo: str):
                 s3_prefix = f"projects/{owner}/{repo}"
                 print(f"Starting S3 upload from {s3_source_folder} to {s3_prefix}")
                 
-                # Configure S3 for SPA routing BEFORE uploading
+                
                 await configure_s3_for_spa_routing()
                 
                 s3_urls = upload_folder_to_s3(s3_source_folder, s3_prefix)
@@ -796,7 +796,7 @@ async def run_backend_project(request: Request, owner: str, repo: str):
             "error": "Docker Desktop needs to be installed and running"
         }, status_code=400)
     
-    # Check if it's a backend project
+    
     backend_check = await check_if_backend_project(request, owner, repo)
     if not backend_check["is_backend"]:
         return JSONResponse({
@@ -807,7 +807,7 @@ async def run_backend_project(request: Request, owner: str, repo: str):
     project_path = backend_check.get("project_path", "")
     backend_type = backend_check["backend_type"]
     
-    # Check if already running
+    
     container_key = f"{owner}_{repo}"
     if container_key in running_backend_containers:
         container_info = running_backend_containers[container_key]
@@ -823,11 +823,11 @@ async def run_backend_project(request: Request, owner: str, repo: str):
                     "backend_type": backend_type
                 }
         except:
-            # Container doesn't exist anymore, remove from tracking
+            
             del running_backend_containers[container_key]
     
     try:
-        # Download and extract repository
+        
         headers = {'Authorization': f'token {token["access_token"]}'}
         zip_url = f'https://api.github.com/repos/{owner}/{repo}/zipball'
         
@@ -862,7 +862,7 @@ async def run_backend_project(request: Request, owner: str, repo: str):
                     "error": f"Project path not found: {project_path}"
                 }, status_code=400)
             
-            # Find available port
+            
             import socket
             def find_free_port():
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -873,7 +873,7 @@ async def run_backend_project(request: Request, owner: str, repo: str):
             
             port = find_free_port()
             
-            # Run the appropriate container
+            
             if backend_type == "nodejs":
                 container = await run_nodejs_container(repo_path, port, owner, repo)
             elif backend_type == "python":
@@ -887,7 +887,7 @@ async def run_backend_project(request: Request, owner: str, repo: str):
             if container:
                 local_url = f"http://localhost:{port}"
                 
-                # Track the running container
+                
                 running_backend_containers[container_key] = {
                     "container_id": container.id,
                     "port": port,
@@ -898,7 +898,7 @@ async def run_backend_project(request: Request, owner: str, repo: str):
                     "started_at": time.time()
                 }
                 
-                # Start a thread to monitor container status
+                
                 def monitor_container():
                     try:
                         container.wait()
@@ -954,10 +954,10 @@ async def get_running_backends(request: Request):
                 "uptime": time.time() - container_info["started_at"]
             })
         except:
-            # Container doesn't exist anymore
+            
             containers_to_remove.append(container_key)
     
-    # Clean up non-existent containers
+    
     for key in containers_to_remove:
         del running_backend_containers[key]
     
@@ -1104,9 +1104,9 @@ def upload_folder_to_s3(local_folder, s3_prefix):
                     }
                     
                     if lower_file.endswith((".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".woff", ".woff2")):
-                        extra_args["CacheControl"] = "public, max-age=31536000"  # 1 year for assets
+                        extra_args["CacheControl"] = "public, max-age=31536000"  
                     elif lower_file.endswith(".html"):
-                        extra_args["CacheControl"] = "public, max-age=0, must-revalidate"  # No cache for HTML
+                        extra_args["CacheControl"] = "public, max-age=0, must-revalidate"  
                     
                     s3.upload_file(
                         local_path, 
@@ -1126,12 +1126,10 @@ def upload_folder_to_s3(local_folder, s3_prefix):
         return []
 
 async def is_react_project(request: Request, owner: str, repo: str):
-    """Simple React project check - now just calls the deeper check function"""
     react_check = await check_if_react_project(request, owner, repo)
     return react_check.get("is_react", False)
 
 async def fix_node_compatibility_issues(repo_path):
-    """Fix Node.js compatibility issues for modern React projects"""
     package_json_path = os.path.join(repo_path, "package.json")
     if not os.path.exists(package_json_path):
         return False
@@ -1143,19 +1141,19 @@ async def fix_node_compatibility_issues(repo_path):
         dependencies = package_data.get('dependencies', {})
         dev_dependencies = package_data.get('devDependencies', {})
         
-        # Check if using problematic Vite version
+        
         vite_version = dev_dependencies.get('vite', dependencies.get('vite', ''))
         
         changes_made = []
         
-        # If using Vite 7.x which requires Node 20+, add engine requirements
+        
         if vite_version and ('7.' in vite_version or '^7' in vite_version):
             if 'engines' not in package_data:
                 package_data['engines'] = {}
             package_data['engines']['node'] = '>=20.0.0'
             changes_made.append("Added Node.js engine requirement")
         
-        # Add legacy-peer-deps option for npm compatibility
+        
         if 'npmrc' not in package_data:
             npmrc_path = os.path.join(repo_path, '.npmrc')
             with open(npmrc_path, 'w') as f:
@@ -1189,9 +1187,9 @@ async def configure_s3_for_spa_routing():
             region_name=AWS_REGION,
         )
         
-        # Configure website with SPA routing - ERROR DOCUMENT IS KEY!
+        
         website_configuration = {
-            'ErrorDocument': {'Key': 'index.html'},  # This makes /about redirect to index.html
+            'ErrorDocument': {'Key': 'index.html'},  
             'IndexDocument': {'Suffix': 'index.html'},
         }
         
@@ -1208,63 +1206,11 @@ async def configure_s3_for_spa_routing():
         return False
 
 
-# async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str):
-   
-#     try:
-#         abs_repo_path = os.path.abspath(repo_path)
-        
-#         # Detect the start command
-#         package_json_path = os.path.join(repo_path, "package.json")
-#         start_command = "npm start"
-        
-#         if os.path.exists(package_json_path):
-#             with open(package_json_path, 'r', encoding='utf-8') as f:
-#                 package_data = json.load(f)
-#                 scripts = package_data.get('scripts', {})
-                
-#                 if 'dev' in scripts:
-#                     start_command = "npm run dev"
-#                 elif 'start' in scripts:
-#                     start_command = "npm start"
-#                 else:
-#                     start_command = "node index.js"  # fallback
-        
-#         # Docker command to run Node.js app
-#         run_command = f"""
-#         set -e
-#         echo "🚀 Starting Node.js backend..."
-#         echo "Installing dependencies..."
-#         npm install --production
-#         echo "Starting application with: {start_command}"
-#         {start_command}
-#         """
-        
-#         container = docker_client.containers.run(
-#             "node:18-alpine",
-#             command=["sh", "-c", run_command],
-#             volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
-#             working_dir='/app',
-#             ports={f'{port}/tcp': port},
-#             environment={
-#                 'NODE_ENV': 'development',
-#                 'PORT': str(port)
-#             },
-#             detach=True,
-            
-#             name=f"backend_{owner}_{repo}_{port}"
-#         )
-        
-#         print(f"✅ Started Node.js container {container.id} on port {port}")
-#         return container
-        
-#     except Exception as e:
-#         print(f"❌ Error starting Node.js container: {str(e)}")
-#         return None
 async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str):
     try:
         abs_repo_path = os.path.abspath(repo_path)
         
-        # Debug: Check what's actually in the repo path
+        
         print(f"🔍 Debugging repo path: {abs_repo_path}")
         if os.path.exists(abs_repo_path):
             print(f"📁 Repo path exists. Contents:")
@@ -1275,9 +1221,9 @@ async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str)
             print(f"❌ Repo path does not exist!")
             return None
         
-        # Detect the start command
+        
         package_json_path = os.path.join(repo_path, "package.json")
-        start_command = "npm start"  # Default fallback
+        start_command = "npm start"  
         
         if os.path.exists(package_json_path):
             print(f"✅ Found package.json at {package_json_path}")
@@ -1291,15 +1237,15 @@ async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str)
                     elif 'start' in scripts:
                         start_command = "npm start"
                     else:
-                        start_command = "node index.js"  # fallback
+                        start_command = "node index.js"  
                     
                     print(f"📋 Detected start command: {start_command}")
             except Exception as e:
                 print(f"❌ Error reading package.json: {e}")
-                start_command = "npm start"  # fallback
+                start_command = "npm start"  
         else:
             print(f"❌ package.json not found, using fallback command")
-            # Check for common entry files
+            
             if os.path.exists(os.path.join(repo_path, "index.js")):
                 start_command = "node index.js"
             elif os.path.exists(os.path.join(repo_path, "server.js")):
@@ -1309,40 +1255,40 @@ async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str)
             else:
                 start_command = "npm start"
         
-        # FIXED: Use Docker COPY via Dockerfile approach instead of volume mounts
-        # Create a temporary Dockerfile that copies files into the image
+        
+        
         dockerfile_content = f"""
 FROM node:18-alpine
 
 WORKDIR /app
 
-# Copy package.json and package-lock.json first for better caching
+
 COPY package*.json ./
 
-# Install dependencies
+
 RUN npm install --verbose || npm install --legacy-peer-deps --verbose
 
-# Copy the rest of the application
+
 COPY . .
 
-# Expose the port
+
 EXPOSE {port}
 
-# Set environment variables
+
 ENV NODE_ENV=development
 ENV PORT={port}
 
-# Start command
+
 CMD ["{start_command.split()[0]}", "{' '.join(start_command.split()[1:])}"]
 """
         
-        # Write Dockerfile to the project directory
+        
         dockerfile_path = os.path.join(repo_path, "Dockerfile.temp")
         with open(dockerfile_path, 'w') as f:
             f.write(dockerfile_content)
         
         try:
-            # Build the Docker image
+            
             print(f"🔨 Building Docker image for {owner}/{repo}...")
             image_name = f"backend_{owner}_{repo}".lower()
             
@@ -1357,7 +1303,7 @@ CMD ["{start_command.split()[0]}", "{' '.join(start_command.split()[1:])}"]
             
             print(f"✅ Docker image built successfully: {image.id}")
             
-            # Run the container from the built image
+            
             container = docker_client.containers.run(
                 image_name,
                 ports={f'{port}/tcp': port},
@@ -1367,100 +1313,29 @@ CMD ["{start_command.split()[0]}", "{' '.join(start_command.split()[1:])}"]
                 },
                 detach=True,
                 name=f"backend_{owner}_{repo}_{port}",
-                remove=False  # Keep container for logs
+                remove=False  
             )
             
             print(f"✅ Started Node.js container {container.id} on port {port}")
             return container
             
         finally:
-            # Clean up the temporary Dockerfile
+            
             if os.path.exists(dockerfile_path):
                 os.remove(dockerfile_path)
         
     except Exception as e:
         print(f"❌ Error starting Node.js container: {str(e)}")
         return None
-# async def run_python_container(repo_path: str, port: int, owner: str, repo: str):
-#     """Run Python backend in Docker container"""
-#     try:
-#         abs_repo_path = os.path.abspath(repo_path)
-        
-#         # Detect Python entry point and framework
-#         start_command = "python app.py"
-        
-#         # Check for common Python entry files
-#         if os.path.exists(os.path.join(repo_path, "main.py")):
-#             start_command = "python main.py"
-#         elif os.path.exists(os.path.join(repo_path, "server.py")):
-#             start_command = "python server.py"
-#         elif os.path.exists(os.path.join(repo_path, "app.py")):
-#             start_command = "python app.py"
-#         elif os.path.exists(os.path.join(repo_path, "wsgi.py")):
-#             start_command = "gunicorn wsgi:app --bind 0.0.0.0:8000"
-#         elif os.path.exists(os.path.join(repo_path, "asgi.py")):
-#             start_command = "uvicorn asgi:app --host 0.0.0.0 --port 8000"
-        
-#         # Check requirements.txt for framework detection
-#         requirements_path = os.path.join(repo_path, "requirements.txt")
-#         if os.path.exists(requirements_path):
-#             with open(requirements_path, 'r') as f:
-#                 requirements = f.read().lower()
-#                 if 'fastapi' in requirements:
-#                     if os.path.exists(os.path.join(repo_path, "main.py")):
-#                         start_command = f"uvicorn main:app --host 0.0.0.0 --port {port} --reload"
-#                     elif os.path.exists(os.path.join(repo_path, "app.py")):
-#                         start_command = f"uvicorn app:app --host 0.0.0.0 --port {port} --reload"
-#                 elif 'flask' in requirements:
-#                     start_command = f"python -m flask run --host 0.0.0.0 --port {port}"
-#                 elif 'django' in requirements:
-#                     start_command = f"python manage.py runserver 0.0.0.0:{port}"
-        
-#         # Docker command to run Python app
-#         run_command = f"""
-#         set -e
-#         echo "🐍 Starting Python backend..."
-#         echo "Installing dependencies..."
-#         if [ -f requirements.txt ]; then
-#             pip install -r requirements.txt
-#         else
-#             echo "No requirements.txt found, proceeding without dependencies"
-#         fi
-#         echo "Starting application with: {start_command}"
-#         {start_command}
-#         """
-        
-#         container = docker_client.containers.run(
-#             "python:3.11-alpine",
-#             command=["sh", "-c", run_command],
-#             volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
-#             working_dir='/app',
-#             ports={f'{port}/tcp': port},
-#             environment={
-#                 'PYTHONPATH': '/app',
-#                 'FLASK_ENV': 'development',
-#                 'FLASK_APP': 'app.py'
-#             },
-#             detach=True,
-#             remove=True,
-#             name=f"backend_{owner}_{repo}_{port}"
-#         )
-        
-#         print(f"✅ Started Python container {container.id} on port {port}")
-#         return container
-        
-#     except Exception as e:
-#         print(f"❌ Error starting Python container: {str(e)}")
-#         return None
 async def run_python_container(repo_path: str, port: int, owner: str, repo: str):
     """Run Python backend in Docker container"""
     try:
         abs_repo_path = os.path.abspath(repo_path)
         
-        # Detect Python entry point and framework
-        start_command = "python app.py"  # Default fallback
         
-        # Check for common Python entry files
+        start_command = "python app.py"
+        
+        
         if os.path.exists(os.path.join(repo_path, "main.py")):
             start_command = "python main.py"
         elif os.path.exists(os.path.join(repo_path, "server.py")):
@@ -1468,106 +1343,62 @@ async def run_python_container(repo_path: str, port: int, owner: str, repo: str)
         elif os.path.exists(os.path.join(repo_path, "app.py")):
             start_command = "python app.py"
         elif os.path.exists(os.path.join(repo_path, "wsgi.py")):
-            start_command = f"gunicorn wsgi:app --bind 0.0.0.0:{port}"
+            start_command = "gunicorn wsgi:app --bind 0.0.0.0:8000"
         elif os.path.exists(os.path.join(repo_path, "asgi.py")):
-            start_command = f"uvicorn asgi:app --host 0.0.0.0 --port {port}"
+            start_command = "uvicorn asgi:app --host 0.0.0.0 --port 8000"
         
-        # Check requirements.txt for framework detection
+        
         requirements_path = os.path.join(repo_path, "requirements.txt")
         if os.path.exists(requirements_path):
-            try:
-                with open(requirements_path, 'r') as f:
-                    requirements = f.read().lower()
-                    if 'fastapi' in requirements:
-                        if os.path.exists(os.path.join(repo_path, "main.py")):
-                            start_command = f"uvicorn main:app --host 0.0.0.0 --port {port} --reload"
-                        elif os.path.exists(os.path.join(repo_path, "app.py")):
-                            start_command = f"uvicorn app:app --host 0.0.0.0 --port {port} --reload"
-                    elif 'flask' in requirements:
-                        start_command = f"python -m flask run --host 0.0.0.0 --port {port}"
-                    elif 'django' in requirements:
-                        start_command = f"python manage.py runserver 0.0.0.0:{port}"
-            except Exception as e:
-                print(f"Error reading requirements.txt: {e}")
+            with open(requirements_path, 'r') as f:
+                requirements = f.read().lower()
+                if 'fastapi' in requirements:
+                    if os.path.exists(os.path.join(repo_path, "main.py")):
+                        start_command = f"uvicorn main:app --host 0.0.0.0 --port {port} --reload"
+                    elif os.path.exists(os.path.join(repo_path, "app.py")):
+                        start_command = f"uvicorn app:app --host 0.0.0.0 --port {port} --reload"
+                elif 'flask' in requirements:
+                    start_command = f"python -m flask run --host 0.0.0.0 --port {port}"
+                elif 'django' in requirements:
+                    start_command = f"python manage.py runserver 0.0.0.0:{port}"
         
-        print(f"📋 Detected Python start command: {start_command}")
         
-        # FIXED: Use Docker COPY via Dockerfile approach
-        dockerfile_content = f"""
-FROM python:3.11-alpine
-
-WORKDIR /app
-
-# Install system dependencies if needed
-RUN apk add --no-cache gcc musl-dev linux-headers
-
-# Copy requirements first for better caching
-COPY requirements.txt* ./
-
-# Install Python dependencies
-RUN if [ -f requirements.txt ]; then pip install -r requirements.txt --verbose; fi
-
-# Copy the rest of the application
-COPY . .
-
-# Expose the port
-EXPOSE {port}
-
-# Set environment variables
-ENV PYTHONPATH=/app
-ENV FLASK_ENV=development
-ENV FLASK_APP=app.py
-
-# Start command
-CMD {start_command.split()}
-"""
+        run_command = f"""
+        set -e
+        echo "🐍 Starting Python backend..."
+        echo "Installing dependencies..."
+        if [ -f requirements.txt ]; then
+            pip install -r requirements.txt
+        else
+            echo "No requirements.txt found, proceeding without dependencies"
+        fi
+        echo "Starting application with: {start_command}"
+        {start_command}
+        """
         
-        # Write Dockerfile to the project directory
-        dockerfile_path = os.path.join(repo_path, "Dockerfile.temp")
-        with open(dockerfile_path, 'w') as f:
-            f.write(dockerfile_content)
+        container = docker_client.containers.run(
+            "python:3.11-alpine",
+            command=["sh", "-c", run_command],
+            volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
+            working_dir='/app',
+            ports={f'{port}/tcp': port},
+            environment={
+                'PYTHONPATH': '/app',
+                'FLASK_ENV': 'development',
+                'FLASK_APP': 'app.py'
+            },
+            detach=True,
+            remove=True,
+            name=f"backend_{owner}_{repo}_{port}"
+        )
         
-        try:
-            # Build the Docker image
-            print(f"🔨 Building Docker image for {owner}/{repo}...")
-            image_name = f"backend_python_{owner}_{repo}".lower()
-            
-            image, build_logs = docker_client.images.build(
-                path=repo_path,
-                dockerfile="Dockerfile.temp",
-                tag=image_name,
-                pull=False,
-                rm=True,
-                forcerm=True
-            )
-            
-            print(f"✅ Docker image built successfully: {image.id}")
-            
-            # Run the container from the built image
-            container = docker_client.containers.run(
-                image_name,
-                ports={f'{port}/tcp': port},
-                environment={
-                    'PYTHONPATH': '/app',
-                    'FLASK_ENV': 'development',
-                    'FLASK_APP': 'app.py'
-                },
-                detach=True,
-                name=f"backend_{owner}_{repo}_{port}",
-                remove=False  # Keep container for logs
-            )
-            
-            print(f"✅ Started Python container {container.id} on port {port}")
-            return container
-            
-        finally:
-            # Clean up the temporary Dockerfile
-            if os.path.exists(dockerfile_path):
-                os.remove(dockerfile_path)
+        print(f"✅ Started Python container {container.id} on port {port}")
+        return container
         
     except Exception as e:
         print(f"❌ Error starting Python container: {str(e)}")
         return None
+
 async def validate_react_project(repo_path: str):
     """Validate React project before building"""
     try:
@@ -1700,7 +1531,7 @@ async def build_react_in_docker(repo_path: str, build_output: str, owner: str, r
             
             echo "✅ Build completed, checking output..."
             
-            # Find the build directory
+            
             BUILD_DIR=""
             if [ -d build ]; then
                 BUILD_DIR="build"
@@ -1718,13 +1549,13 @@ async def build_react_in_docker(repo_path: str, build_output: str, owner: str, r
             echo "📊 Build directory contents:"
             ls -la "$BUILD_DIR"
             
-            # Validate critical files
+            
             if [ ! -f "$BUILD_DIR/index.html" ]; then
                 echo "❌ No index.html found in build!"
                 exit 1
             fi
             
-            # Check index.html size
+            
             INDEX_SIZE=$(wc -c < "$BUILD_DIR/index.html")
             echo "📄 index.html size: $INDEX_SIZE bytes"
             
@@ -1734,7 +1565,7 @@ async def build_react_in_docker(repo_path: str, build_output: str, owner: str, r
                 head -5 "$BUILD_DIR/index.html"
             fi
             
-            # Check for React root div
+            
             if grep -q 'id="root"' "$BUILD_DIR/index.html" || grep -q "id='root'" "$BUILD_DIR/index.html"; then
                 echo "✅ React root div found"
             else
@@ -1743,7 +1574,7 @@ async def build_react_in_docker(repo_path: str, build_output: str, owner: str, r
                 cat "$BUILD_DIR/index.html"
             fi
             
-            # Check for script tags
+            
             SCRIPT_COUNT=$(grep -c '<script' "$BUILD_DIR/index.html" || echo "0")
             echo "📜 Script tags found: $SCRIPT_COUNT"
             
@@ -1760,38 +1591,38 @@ async def build_react_in_docker(repo_path: str, build_output: str, owner: str, r
             """
         ]
         
-        # Run the build in Node.js container
+        
         container = docker_client.containers.run(
-            "node:20-alpine",  # Use Node 20 for compatibility with latest Vite
+            "node:20-alpine",  
             command=build_command,
             volumes={
-                abs_repo_path: {'bind': '/source', 'mode': 'ro'},    # React project source (read-only)
-                abs_build_output: {'bind': '/output', 'mode': 'rw'}  # Build output (writable)
+                abs_repo_path: {'bind': '/source', 'mode': 'ro'},    
+                abs_build_output: {'bind': '/output', 'mode': 'rw'}  
             },
             working_dir='/app',
-            remove=True,  # Auto-remove when done
+            remove=True,  
             detach=True
         )
         
-        # Wait for completion and get logs
+        
         result = container.wait()
         logs = container.logs().decode('utf-8')
         
-        # Enhanced success validation
+        
         build_success = (
             result['StatusCode'] == 0 and 
             os.path.exists(build_output) and 
             os.path.exists(os.path.join(build_output, "index.html"))
         )
         
-        # Additional validation for blank page prevention
+        
         if build_success:
             index_path = os.path.join(build_output, "index.html")
             try:
                 with open(index_path, 'r', encoding='utf-8') as f:
                     index_content = f.read()
                 
-                # Check for common blank page issues
+                
                 if len(index_content.strip()) < 100:
                     build_success = False
                     logs += "\n❌ VALIDATION FAILED: index.html is too small"
