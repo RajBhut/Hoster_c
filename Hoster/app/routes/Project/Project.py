@@ -1207,131 +1207,135 @@ async def configure_s3_for_spa_routing():
 
 
 async def run_nodejs_container(repo_path: str, port: int, owner: str, repo: str):
+   
     try:
         abs_repo_path = os.path.abspath(repo_path)
         
-        
-        print(f"🔍 Debugging repo path: {abs_repo_path}")
-        if os.path.exists(abs_repo_path):
-            print(f"📁 Repo path exists. Contents:")
-            for item in os.listdir(abs_repo_path):
-                item_path = os.path.join(abs_repo_path, item)
-                print(f"  {'📁' if os.path.isdir(item_path) else '📄'} {item}")
-        else:
-            print(f"❌ Repo path does not exist!")
-            return None
-        
-        
+        # Detect the start command
         package_json_path = os.path.join(repo_path, "package.json")
-        start_command = "npm start"  
+        start_command = "npm start"  # Default fallback
         
         if os.path.exists(package_json_path):
-            print(f"✅ Found package.json at {package_json_path}")
-            try:
-                with open(package_json_path, 'r', encoding='utf-8') as f:
-                    package_data = json.load(f)
-                    scripts = package_data.get('scripts', {})
-                    
-                    if 'dev' in scripts:
-                        start_command = "npm run dev"
-                    elif 'start' in scripts:
-                        start_command = "npm start"
-                    else:
-                        start_command = "node index.js"  
-                    
-                    print(f"📋 Detected start command: {start_command}")
-            except Exception as e:
-                print(f"❌ Error reading package.json: {e}")
-                start_command = "npm start"  
-        else:
-            print(f"❌ package.json not found, using fallback command")
-            
-            if os.path.exists(os.path.join(repo_path, "index.js")):
-                start_command = "node index.js"
-            elif os.path.exists(os.path.join(repo_path, "server.js")):
-                start_command = "node server.js"
-            elif os.path.exists(os.path.join(repo_path, "app.js")):
-                start_command = "node app.js"
-            else:
-                start_command = "npm start"
+            with open(package_json_path, 'r', encoding='utf-8') as f:
+                package_data = json.load(f)
+                scripts = package_data.get('scripts', {})
+                
+                if 'dev' in scripts:
+                    start_command = "npm run dev"
+                elif 'start' in scripts:
+                    start_command = "npm start"
+                else:
+                    start_command = "node index.js"  # fallback
         
+        # Docker command to run Node.js app
+        run_command = f"""
+        set -e
+        echo "🚀 Starting Node.js backend..."
+        echo "Installing dependencies..."
+        npm install --production
+        echo "Starting application with: {start_command}"
+        {start_command}
+        """
         
+        container = docker_client.containers.run(
+            "node:18-alpine",
+            command=["sh", "-c", run_command],
+            volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
+            working_dir='/app',
+            ports={f'{port}/tcp': port},
+            environment={
+                'NODE_ENV': 'development',
+                'PORT': str(port)
+            },
+            detach=True,
+            
+            name=f"backend_{owner}_{repo}_{port}"
+        )
         
-        dockerfile_content = f"""
-FROM node:18-alpine
-
-WORKDIR /app
-
-
-COPY package*.json ./
-
-
-RUN npm install --verbose || npm install --legacy-peer-deps --verbose
-
-
-COPY . .
-
-
-EXPOSE {port}
-
-
-ENV NODE_ENV=development
-ENV PORT={port}
-
-
-CMD ["{start_command.split()[0]}", "{' '.join(start_command.split()[1:])}"]
-"""
-        
-        
-        dockerfile_path = os.path.join(repo_path, "Dockerfile.temp")
-        with open(dockerfile_path, 'w') as f:
-            f.write(dockerfile_content)
-        
-        try:
-            
-            print(f"🔨 Building Docker image for {owner}/{repo}...")
-            image_name = f"backend_{owner}_{repo}".lower()
-            
-            image, build_logs = docker_client.images.build(
-                path=repo_path,
-                dockerfile="Dockerfile.temp",
-                tag=image_name,
-                pull=False,
-                rm=True,
-                forcerm=True
-            )
-            
-            print(f"✅ Docker image built successfully: {image.id}")
-            
-            
-            container = docker_client.containers.run(
-                image_name,
-                ports={f'{port}/tcp': port},
-                environment={
-                    'NODE_ENV': 'development',
-                    'PORT': str(port)
-                },
-                detach=True,
-                name=f"backend_{owner}_{repo}_{port}",
-                remove=False  
-            )
-            
-            print(f"✅ Started Node.js container {container.id} on port {port}")
-            return container
-            
-        finally:
-            
-            if os.path.exists(dockerfile_path):
-                os.remove(dockerfile_path)
+        print(f"✅ Started Node.js container {container.id} on port {port}")
+        return container
         
     except Exception as e:
         print(f"❌ Error starting Node.js container: {str(e)}")
         return None
+# async def run_python_container(repo_path: str, port: int, owner: str, repo: str):
+#     """Run Python backend in Docker container"""
+#     try:
+#         abs_repo_path = os.path.abspath(repo_path)
+        
+#         # Detect Python entry point and framework
+#         start_command = "python app.py"
+        
+#         # Check for common Python entry files
+#         if os.path.exists(os.path.join(repo_path, "main.py")):
+#             start_command = "python main.py"
+#         elif os.path.exists(os.path.join(repo_path, "server.py")):
+#             start_command = "python server.py"
+#         elif os.path.exists(os.path.join(repo_path, "app.py")):
+#             start_command = "python app.py"
+#         elif os.path.exists(os.path.join(repo_path, "wsgi.py")):
+#             start_command = "gunicorn wsgi:app --bind 0.0.0.0:8000"
+#         elif os.path.exists(os.path.join(repo_path, "asgi.py")):
+#             start_command = "uvicorn asgi:app --host 0.0.0.0 --port 8000"
+        
+#         # Check requirements.txt for framework detection
+#         requirements_path = os.path.join(repo_path, "requirements.txt")
+#         if os.path.exists(requirements_path):
+#             with open(requirements_path, 'r') as f:
+#                 requirements = f.read().lower()
+#                 if 'fastapi' in requirements:
+#                     if os.path.exists(os.path.join(repo_path, "main.py")):
+#                         start_command = f"uvicorn main:app --host 0.0.0.0 --port {port} --reload"
+#                     elif os.path.exists(os.path.join(repo_path, "app.py")):
+#                         start_command = f"uvicorn app:app --host 0.0.0.0 --port {port} --reload"
+#                 elif 'flask' in requirements:
+#                     start_command = f"python -m flask run --host 0.0.0.0 --port {port}"
+#                 elif 'django' in requirements:
+#                     start_command = f"python manage.py runserver 0.0.0.0:{port}"
+        
+#         # Docker command to run Python app
+#         run_command = f"""
+#         set -e
+#         echo "🐍 Starting Python backend..."
+#         echo "Installing dependencies..."
+#         if [ -f requirements.txt ]; then
+#             pip install -r requirements.txt
+#         else
+#             echo "No requirements.txt found, proceeding without dependencies"
+#         fi
+#         echo "Starting application with: {start_command}"
+#         {start_command}
+#         """
+        
+#         container = docker_client.containers.run(
+#             "python:3.11-alpine",
+#             command=["sh", "-c", run_command],
+#             volumes={abs_repo_path: {'bind': '/app', 'mode': 'ro'}},
+#             working_dir='/app',
+#             ports={f'{port}/tcp': port},
+#             environment={
+#                 'PYTHONPATH': '/app',
+#                 'FLASK_ENV': 'development',
+#                 'FLASK_APP': 'app.py'
+#             },
+#             detach=True,
+#             remove=True,
+#             name=f"backend_{owner}_{repo}_{port}"
+#         )
+        
+#         print(f"✅ Started Python container {container.id} on port {port}")
+#         return container
+        
+#     except Exception as e:
+#         print(f"❌ Error starting Python container: {str(e)}")
+#         return None
 async def run_python_container(repo_path: str, port: int, owner: str, repo: str):
     """Run Python backend in Docker container"""
     try:
         abs_repo_path = os.path.abspath(repo_path)
         
+        # Detect Python entry point and framework
+        start_command = "python app.py"  # Default fallback
         
         start_command = "python app.py"
         
@@ -1362,7 +1366,7 @@ async def run_python_container(repo_path: str, port: int, owner: str, repo: str)
                 elif 'django' in requirements:
                     start_command = f"python manage.py runserver 0.0.0.0:{port}"
         
-        
+        # Docker command to run Python app
         run_command = f"""
         set -e
         echo "🐍 Starting Python backend..."
